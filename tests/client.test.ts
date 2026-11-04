@@ -4,6 +4,7 @@ import {
 	buildCompletionContext,
 	type CompletionBackend,
 	completeSnapshot,
+	completionSettings,
 	MAX_PREFIX_CHARS,
 	MAX_SUFFIX_CHARS,
 	normalizeCompletionText,
@@ -11,6 +12,8 @@ import {
 } from "../src/client";
 
 const idleSignal = new AbortController().signal;
+const background = { cwd: "/project", recentTurns: [{ role: "user" as const, text: "请继续完善项目." }], recentFiles: [] };
+const emptyDraft = { prefix: "", suffix: "" };
 const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?:^|[^\uD800-\uDBFF])[\uDC00-\uDFFF]/;
 
 function reply(text: string, extra: Partial<AssistantMessage> = {}): AssistantMessage {
@@ -92,6 +95,39 @@ describe("buildCompletionContext", () => {
 });
 
 describe("completeSnapshot", () => {
+	test("按输入框状态选择预算, 包括仅有后缀的输入", () => {
+		expect(completionSettings(emptyDraft)).toEqual({ maxTokens: 1024, deadlineMs: 15000, maxOutputChars: 1200 });
+		expect(completionSettings({ prefix: "", suffix: "x" })).toEqual({ maxTokens: 96, deadlineMs: 4000, maxOutputChars: 400 });
+	});
+
+	test("空框保留详细单行建议, 普通续写仍受短上限约束", async () => {
+		const long = "请完善项目".repeat(250);
+		const { backend, calls } = recording(reply(`<ins>${long}</ins>`));
+		expect(await completeSnapshot(backend, emptyDraft, idleSignal, { background })).toBe(long.slice(0, 1200));
+		expect(await completeSnapshot(backend, { prefix: "x", suffix: "" }, idleSignal)).toBe(long.slice(0, 400));
+		expect(calls[0].context.systemPrompt).not.toEqual(calls[1].context.systemPrompt);
+	});
+
+	test("空框没有有效对话背景时不请求", async () => {
+		const { backend, calls } = recording(reply("不应调用"));
+		expect(await completeSnapshot(backend, emptyDraft, idleSignal)).toBeNull();
+		expect(await completeSnapshot(backend, emptyDraft, idleSignal, { background: { ...background, recentTurns: [] } })).toBeNull();
+		expect(await completeSnapshot(backend, emptyDraft, idleSignal, { background: { ...background, recentTurns: [{ role: "user", text: "  " }] } })).toBeNull();
+		expect(calls.length).toBe(0);
+	});
+
+	test("空框请求仍遵循取消和超时", async () => {
+		const waiting: CompletionBackend = (_context, signal) => {
+			const { promise, reject } = Promise.withResolvers<AssistantMessage>();
+			signal.addEventListener("abort", () => reject(new Error("stopped")), { once: true });
+			return promise;
+		};
+		const controller = new AbortController();
+		const pending = completeSnapshot(waiting, emptyDraft, controller.signal, { background });
+		controller.abort();
+		expect((await errorOf(pending)).name).toBe("AbortError");
+		expect(await completeSnapshot(waiting, emptyDraft, idleSignal, { background, deadlineMs: 5 })).toBeNull();
+	});
 	test("returns the normalised text of the reply", async () => {
 		const { backend, calls } = recording(reply("rld\nignored"));
 		const text = await completeSnapshot(backend, { prefix: "hello wo", suffix: "" }, idleSignal);

@@ -1,9 +1,16 @@
 import { completeSimple, type Model } from "@oh-my-pi/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type { KeyId } from "@oh-my-pi/pi-tui";
-import { type CompletionSnapshot, completeSnapshot, MAX_COMPLETION_TOKENS } from "./client";
+import { type CompletionSnapshot, completeSnapshot, completionSettings } from "./client";
 import { collectPromptContext } from "./context";
-import { PromptAutocompleteEditor, type RefineState } from "./editor";
+import {
+	createPromptAutocompleteEditor,
+	EDITOR_LAYERS,
+	type EditorConstructor,
+	type EditorLayer,
+	type PromptAutocompleteEditor,
+	type RefineState,
+} from "./editor";
 import { type PickerResult, RefinePicker } from "./picker";
 import { REFINE_PRESETS, RefineError, refineDraft } from "./refine";
 
@@ -104,7 +111,7 @@ export default function promptAutocomplete(pi: ExtensionAPI): void {
 				completeSimple(model, context, {
 					apiKey: ctx.modelRegistry.resolver(model, sessionId),
 					sessionId,
-					maxTokens: MAX_COMPLETION_TOKENS,
+					maxTokens: completionSettings(snapshot).maxTokens,
 					temperature: 0,
 					// Clamped to the model's lowest effort where reasoning cannot be switched off.
 					disableReasoning: true,
@@ -233,16 +240,43 @@ export default function promptAutocomplete(pi: ExtensionAPI): void {
 		if (!ctx.hasUI || ctx.mode !== "tui" || ctx.agent.kind !== "main") return;
 		resolved.autocomplete = undefined;
 		resolved.refine = undefined;
-		ctx.ui.setEditorComponent((tui, theme, keybindings) => {
-			editor?.dispose();
-			editor = new PromptAutocompleteEditor(tui, theme, keybindings, {
-				complete: (snapshot, signal) => complete(ctx, snapshot, signal),
-				onError: error => reportError(ctx, error),
-				onRefineStateChange: state => showRefineState(ctx, state),
-			});
-			editor.setAutocompleteEnabled(enabled);
-			return editor;
-		});
+		type EditorFactory = ((...args: ConstructorParameters<EditorConstructor>) => InstanceType<EditorConstructor>) & {
+			[EDITOR_LAYERS]?: EditorLayer[];
+		};
+		// 旧版类型声明尚未包含此方法，运行时由当前 OMP 提供。
+		const ui = ctx.ui as typeof ctx.ui & { getEditorComponent?(): EditorFactory | undefined };
+		const previous = ui.getEditorComponent?.();
+		const layer: EditorLayer = Base => {
+			const PromptEditor = createPromptAutocompleteEditor(Base);
+			return class extends PromptEditor {
+				constructor(...args: ConstructorParameters<EditorConstructor>) {
+					editor?.dispose();
+					super(...args, {
+						complete: (snapshot, signal) => complete(ctx, snapshot, signal),
+						onError: error => reportError(ctx, error),
+						onRefineStateChange: state => showRefineState(ctx, state),
+					});
+					editor = this;
+					this.setAutocompleteEnabled(enabled);
+				}
+			};
+		};
+		const layers = [...(previous?.[EDITOR_LAYERS] ?? []), layer];
+		// 宿主版本包含此导出，但仓库的旧类型声明没有它。
+		const host = pi.pi as unknown as { CustomEditor: EditorConstructor };
+		const HostEditor = host.CustomEditor;
+		const Editor = layers.reduce((Base, applyLayer) => applyLayer(Base), HostEditor);
+		const factory: EditorFactory = (tui, theme, keybindings) => new Editor(tui, theme, keybindings);
+		factory[EDITOR_LAYERS] = layers;
+		ctx.ui.setEditorComponent(factory);
+	});
+
+	pi.on("agent_start", () => {
+		editor?.setAgentBusy(true);
+	});
+
+	pi.on("agent_end", event => {
+		if (!event.willContinue) editor?.setAgentBusy(false);
 	});
 
 	pi.on("session_shutdown", () => {

@@ -20,7 +20,7 @@
  *  - disabling or disposing cancels all work and hides the ghost;
  *  - a failed request is reported once through `onError` and is not retried until new input.
  */
-import type { CompletionSnapshot } from "./client";
+import { completionSettings, type CompletionSnapshot } from "./client";
 
 export interface CompletionControllerOptions {
 	/** Performs one completion request. Must honour `signal`. */
@@ -46,6 +46,7 @@ interface SuggestionBasis {
 	readonly prefix: string;
 	readonly suffix: string;
 	readonly text: string;
+	readonly maxShownChars: number;
 }
 
 interface InFlightRequest {
@@ -59,11 +60,11 @@ function snapshotKey(snapshot: CompletionSnapshot): string {
 }
 
 /** Cap the shown text without splitting a surrogate pair. */
-function capShown(text: string): string {
-	if (text.length <= MAX_SHOWN_CHARS) {
+function capShown(text: string, maxChars: number): string {
+	if (text.length <= maxChars) {
 		return text;
 	}
-	let end = MAX_SHOWN_CHARS;
+	let end = maxChars;
 	const code = text.charCodeAt(end - 1);
 	if (code >= 0xd800 && code <= 0xdbff) {
 		end -= 1;
@@ -158,8 +159,14 @@ export class CompletionController {
 			return null;
 		}
 		const projected = this.project(snapshot);
-		return projected !== null && projected.length > 0 ? capShown(projected) : null;
+		return projected !== null && projected.length > 0 ? capShown(projected, this.basis!.maxShownChars) : null;
 	}
+	/** 返回由全空输入生成的完整建议余量, 供编辑器单独折行展示. */
+	getDetailedSuggestion(snapshot: CompletionSnapshot): string | null {
+		if (!this.basis || this.basis.prefix !== "" || this.basis.suffix !== "") return null;
+		return this.getSuggestion(snapshot);
+	}
+
 
 	/**
 	 * Suppress the suggestion for this exact snapshot (and cancel any pending work for it).
@@ -196,6 +203,16 @@ export class CompletionController {
 			this.cancelWork();
 			this.basis = null;
 		}
+		this.onUpdate();
+	}
+
+	/** 清除当前会话背景相关的请求、建议和忽略记录, 并允许相同输入重新请求. */
+	reset(): void {
+		if (this.disposed) return;
+		this.cancelWork();
+		this.basis = null;
+		this.inputKey = null;
+		this.dismissed.length = 0;
 		this.onUpdate();
 	}
 
@@ -296,7 +313,11 @@ export class CompletionController {
 			this.onUpdate();
 			return;
 		}
-		this.basis = { prefix: snapshot.prefix, suffix: snapshot.suffix, text };
+		const maxShownChars = snapshot.prefix === "" && snapshot.suffix === ""
+			? completionSettings(snapshot).maxOutputChars
+			: MAX_SHOWN_CHARS;
+		const basisText = snapshot.prefix === "" && snapshot.suffix === "" ? capShown(text, maxShownChars) : text;
+		this.basis = { prefix: snapshot.prefix, suffix: snapshot.suffix, text: basisText, maxShownChars };
 		this.onUpdate();
 	}
 

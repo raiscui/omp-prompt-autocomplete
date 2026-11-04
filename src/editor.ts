@@ -5,8 +5,11 @@ import {
 	type KeybindingsManager,
 	matchesKey,
 	type TUI,
+	wrapTextWithAnsi,
 } from "@oh-my-pi/pi-tui";
 import { CustomEditor } from "@oh-my-pi/pi-tui/prompt/custom-editor";
+import { text as nativeText } from "@oh-my-pi/pi-tui/native/describe";
+import type { DescribeContext, NativeNode } from "@oh-my-pi/pi-tui/native/node";
 import type { CompletionSnapshot } from "./client";
 import { type CompletionErrorHandler, CompletionController, type CompletionRequest } from "./controller";
 import { nextWordOf } from "./next-word";
@@ -50,12 +53,17 @@ interface ActiveRefine {
 	readonly controller: AbortController;
 }
 
-/** Keep the native composer, spelling, menus, and ghost acceptance machinery. */
-export class PromptAutocompleteEditor extends CustomEditor {
+export type EditorConstructor = new (tui: TUI, theme: EditorTheme, keybindings: KeybindingsManager) => CustomEditor;
+export type EditorLayer = (Base: EditorConstructor) => EditorConstructor;
+export const EDITOR_LAYERS = Symbol.for("omp.editor.layers.v1");
+
+/** 保留宿主编辑器行为, 同时允许其他编辑器层参与继承链. */
+export const createPromptAutocompleteEditor = (Base: EditorConstructor) => class PromptAutocompleteEditor extends Base {
 	#controller: CompletionController;
 	#keybindings: KeybindingsManager;
 	#onRefineStateChange: ((state: RefineState) => void) | undefined;
 	#enabled = true;
+	#agentBusy = false;
 	#disposed = false;
 	#autocompleteProvider?: AutocompleteProvider;
 	#refining: ActiveRefine | null = null;
@@ -106,6 +114,13 @@ export class PromptAutocompleteEditor extends CustomEditor {
 		this.#sync();
 		this.invalidate();
 		this.tui?.requestRender();
+	}
+
+	/** Agent 执行期间隐藏并取消建议; 状态切换时清除旧会话背景. */
+	setAgentBusy(busy: boolean): void {
+		if (this.#disposed || this.#agentBusy === busy) return;
+		this.#agentBusy = busy;
+		this.#controller.reset();
 	}
 
 	get refineState(): RefineState {
@@ -178,11 +193,36 @@ export class PromptAutocompleteEditor extends CustomEditor {
 
 	override render(width: number): readonly string[] {
 		this.#trackRefineDraft();
-		this.#sync();
-		return super.render(width);
+		const snapshot = this.#sync();
+		const lines = super.render(width);
+		const suggestion = snapshot && this.#controller.getDetailedSuggestion(snapshot);
+		if (!suggestion) return lines;
+		return [...lines, ...this.#suggestionRows(suggestion, width).map(line => `\x1b[2m${line}\x1b[0m`)];
+	}
+
+	override describe(cx: DescribeContext): NativeNode {
+		this.#trackRefineDraft();
+		const snapshot = this.#sync();
+		const root = super.describe(cx);
+		const suggestion = snapshot && this.#controller.getDetailedSuggestion(snapshot);
+		if (!suggestion) return root;
+		return { ...root, c: [...(root.c ?? []), ...this.#suggestionRows(suggestion, cx.cols).map(line => nativeText(line))] };
+	}
+
+	#suggestionRows(suggestion: string, width: number): string[] {
+		return wrapTextWithAnsi(`建议: ${suggestion}`, Math.max(1, width));
 	}
 
 	override handleInput(data: string): void {
+		if (this.isShowingAutocomplete()) {
+			try {
+				super.handleInput(data);
+			} finally {
+				this.#trackRefineDraft();
+				this.#sync();
+			}
+			return;
+		}
 		// Refine owns Escape before the ghost, menus and the agent interrupt: it cancels an
 		// in-flight rewrite, or reverts an unedited one. The next Escape keeps its native meaning.
 		if (this.#refining && matchesKey(data, "escape")) {
@@ -256,6 +296,7 @@ export class PromptAutocompleteEditor extends CustomEditor {
 		if (
 			this.#disposed ||
 			!this.#enabled ||
+			this.#agentBusy ||
 			// No ghost on a rewrite in flight or still unedited, so Escape always means revert there.
 			this.#refining ||
 			this.#refined ||
@@ -271,6 +312,7 @@ export class PromptAutocompleteEditor extends CustomEditor {
 		if (this.#autocompleteProvider?.getInlineHint?.(lines, line, col)) return null;
 
 		const text = lines.join("\n");
+		if (text === "") return { prefix: "", suffix: "" };
 		if (!text.trim() || /^[\/!]/.test(text.trimStart())) return null;
 		let offset = col;
 		for (let i = 0; i < line; i++) offset += lines[i].length + 1;
@@ -280,7 +322,7 @@ export class PromptAutocompleteEditor extends CustomEditor {
 		// Avoid racing file/model mentions and path/skill completion while their
 		// native menu is still loading. Code fences retain ordinary code suffixes.
 		const token = /(?:^|\s)(\S+)$/.exec(prefix)?.[1] ?? "";
-		if (/^[@^]/.test(token)) return null;
+		if (/^[@^$]/.test(token)) return null;
 		let fence: string | undefined;
 		for (let i = 0; i <= line; i++) {
 			const marker = /^\s*(`{3,}|~{3,})/.exec(lines[i])?.[1];
@@ -291,4 +333,7 @@ export class PromptAutocompleteEditor extends CustomEditor {
 		if (!fence && /[\\/]/.test(token)) return null;
 		return { prefix, suffix: text.slice(offset) };
 	}
-}
+};
+
+export const PromptAutocompleteEditor = createPromptAutocompleteEditor(CustomEditor);
+export type PromptAutocompleteEditor = InstanceType<typeof PromptAutocompleteEditor>;

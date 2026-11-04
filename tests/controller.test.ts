@@ -366,3 +366,71 @@ test("caps the shown suggestion without splitting surrogate pairs and keeps proj
 	controller.update(at(typed));
 	expect(controller.getSuggestion(at(typed))).toBe("\u{1F600}tail");
 });
+
+test("empty basis keeps its detailed limit while projecting and divergent input returns to the short limit", async () => {
+	vi.useFakeTimers();
+	const fake = createCompleter();
+	const controller = new CompletionController({ complete: fake.complete, onUpdate: () => {}, debounceMs: 0 });
+	const detailed = `first ${"a".repeat(1300)}`;
+	controller.update(at(""));
+	await fireDebounce();
+	expect(fake.calls[0].snapshot).toEqual(at(""));
+	fake.calls[0].resolve(detailed);
+	await settle();
+	expect(controller.getSuggestion(at(""))).toBe(detailed.slice(0, 1200));
+	controller.update(at("first "));
+	expect(controller.getSuggestion(at("first "))).toBe(detailed.slice(6, 1200));
+	await fireDebounce();
+	expect(fake.calls.length).toBe(1);
+	controller.update(at("different"));
+	await fireDebounce();
+	expect(fake.calls.length).toBe(2);
+	fake.calls[1].resolve("b".repeat(300));
+	await settle();
+	expect(controller.getSuggestion(at("different"))).toBe("b".repeat(160));
+});
+
+test("reset cancels old work, clears dismissals and allows the same snapshot in a new context", async () => {
+	vi.useFakeTimers();
+	const fake = createCompleter();
+	const controller = new CompletionController({ complete: fake.complete, onUpdate: () => {}, debounceMs: 0 });
+	controller.update(at(""));
+	await fireDebounce();
+	controller.reset();
+	expect(fake.calls[0].signal.aborted).toBe(true);
+	controller.update(at(""));
+	await fireDebounce();
+	fake.calls[0].resolve("old");
+	await settle();
+	expect(controller.getSuggestion(at(""))).toBeNull();
+	fake.calls[1].resolve("new");
+	await settle();
+	expect(controller.getSuggestion(at(""))).toBe("new");
+	expect(controller.dismiss(at(""))).toBe(true);
+	controller.reset();
+	controller.update(at(""));
+	await fireDebounce();
+	fake.calls[2].resolve("another");
+	await settle();
+	expect(controller.getSuggestion(at(""))).toBe("another");
+});
+
+test("reset permits reentrant synchronization without recursively scheduling duplicate requests", async () => {
+	vi.useFakeTimers();
+	const fake = createCompleter();
+	let controller!: CompletionController;
+	controller = new CompletionController({
+		complete: fake.complete,
+		onUpdate: () => controller.update(at("")),
+		debounceMs: 0,
+	});
+	controller.update(at(""));
+	await fireDebounce();
+	controller.reset();
+	expect(fake.calls[0].signal.aborted).toBe(true);
+	await fireDebounce();
+	expect(fake.calls.length).toBe(2);
+	fake.calls[1].resolve("fresh");
+	await settle();
+	expect(controller.getSuggestion(at(""))).toBe("fresh");
+});

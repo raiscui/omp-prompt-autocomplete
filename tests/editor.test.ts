@@ -8,8 +8,16 @@ import {
 	ProcessTerminal,
 	TUI,
 } from "@oh-my-pi/pi-tui";
+import { CustomEditor } from "@oh-my-pi/pi-tui/prompt/custom-editor";
 import type { CompletionSnapshot } from "../src/client";
-import { PromptAutocompleteEditor, type PromptAutocompleteEditorOptions, type RefineState } from "../src/editor";
+import {
+	createPromptAutocompleteEditor,
+	type EditorConstructor,
+	type EditorLayer,
+	PromptAutocompleteEditor,
+	type PromptAutocompleteEditorOptions,
+	type RefineState,
+} from "../src/editor";
 
 const realSetTimeout = globalThis.setTimeout;
 const realClearTimeout = globalThis.clearTimeout;
@@ -217,7 +225,7 @@ test("reenabling completion permits a fresh result for the unchanged draft", asy
 test("commands, shell drafts, mentions, and paths never start local inference", async () => {
 	let calls = 0;
 	const editor = createEditor(async () => { calls++; return "unexpected"; });
-	for (const draft of ["", "   ", "/model gem", "  !git status", "Read @src", "Ask ^gemma", "Read ./src", "Read src/file", "Read C:\\src", "Use /skill"]) {
+	for (const draft of ["   ", "/model gem", "  !git status", "Read @src", "Ask ^gemma", "Use $", "Use $skill", "$skill", "Read ./src", "Read src/file", "Read C:\\src", "Use /skill"]) {
 		editor.setText(draft);
 		editor.render(100);
 		await debounce();
@@ -351,6 +359,84 @@ test("Ctrl+Right accepts the ghost one word at a time without refetching", async
 	// Exhausted: the next press is native word-right at the line end and inserts nothing.
 	editor.handleInput(CTRL_RIGHT);
 	expect(editor.getText()).toBe("Please add error handling for failed API requests.");
+});
+
+test("an empty editor requests a detailed suggestion and accepts the full remainder after one word", async () => {
+	const snapshots: CompletionSnapshot[] = [];
+	const suggestion = `First ${"detail ".repeat(40)}done.`;
+	const editor = createEditor(async snapshot => {
+		snapshots.push(snapshot);
+		return suggestion;
+	});
+	editor.placeholder = () => "placeholder";
+	editor.nativePlaceholder = "placeholder";
+	editor.render(100);
+	await debounce();
+	expect(snapshots).toEqual([{ prefix: "", suffix: "" }]);
+	expect(screen(editor)).toContain("done.");
+	const native = editor.describe({ cols: 40, reduceMotion: false, dark: true, supports: () => true, feature: () => false });
+	expect(JSON.stringify(native)).toContain("done.");
+	editor.handleInput(CTRL_RIGHT);
+	expect(editor.getText()).toBe("First");
+	await debounce();
+	expect(snapshots.length).toBe(1);
+	editor.handleInput("\x1b[C");
+	expect(editor.getText()).toBe(suggestion);
+});
+
+test("placeholder does not prevent Tab or right arrow from accepting an empty-draft suggestion", async () => {
+	for (const key of ["\t", "\x1b[C"]) {
+		const suggestion = `完整建议 ${"内容".repeat(100)}`;
+		const editor = createEditor(async () => suggestion);
+		editor.placeholder = () => "placeholder";
+		editor.nativePlaceholder = "placeholder";
+		editor.render(80);
+		await debounce();
+		editor.handleInput(key);
+		expect(editor.getText()).toBe(key === "\t" ? `${suggestion} ` : suggestion);
+	}
+});
+
+test("whitespace-only drafts do not request an empty-context suggestion", async () => {
+	const snapshots: CompletionSnapshot[] = [];
+	const editor = createEditor(async snapshot => {
+		snapshots.push(snapshot);
+		return "suggestion";
+	});
+	editor.setText("   ");
+	editor.render(100);
+	await debounce();
+	expect(snapshots).toEqual([]);
+});
+
+test("agent busy cancels old requests and resets dismissals before generating for the next turn", async () => {
+	const first = deferred();
+	const calls: Array<{ snapshot: CompletionSnapshot; signal: AbortSignal }> = [];
+	const editor = createEditor(async (snapshot, signal) => {
+		calls.push({ snapshot, signal });
+		return calls.length === 1 ? first.promise : calls.length === 2 ? "new suggestion" : "next suggestion";
+	});
+	editor.render(100);
+	await debounce();
+	editor.setAgentBusy(true);
+	expect(calls[0].signal.aborted).toBe(true);
+	editor.render(100);
+	await debounce();
+	expect(calls.length).toBe(1);
+	editor.setAgentBusy(false);
+	await debounce();
+	expect(calls.length).toBe(2);
+	first.resolve("stale suggestion");
+	await settle();
+	expect(screen(editor)).toContain("new suggestion");
+	expect(screen(editor)).not.toContain("stale suggestion");
+	editor.handleInput("\x1b");
+	expect(screen(editor)).not.toContain("new suggestion");
+	editor.setAgentBusy(true);
+	editor.setAgentBusy(false);
+	await debounce();
+	expect(calls.length).toBe(3);
+	expect(screen(editor)).toContain("next suggestion");
 });
 
 test("Ctrl+Right steps through Thai suggestions by dictionary word", async () => {
@@ -507,3 +593,80 @@ test("an empty draft cannot start a rewrite", () => {
 	expect(editor.beginRefine()).toBeUndefined();
 	expect(editor.refineState.kind).toBe("idle");
 });
+
+for (const promptFirst of [true, false]) {
+	test(`技能层与提示层${promptFirst ? "先提示后技能" : "先技能后提示"}均保留弹窗和生命周期`, async () => {
+		const calls: CompletionSnapshot[] = [];
+		const pending = deferred();
+		const promptLayer: EditorLayer = Base => {
+			const PromptEditor = createPromptAutocompleteEditor(Base);
+			return class extends PromptEditor {
+				constructor(...args: ConstructorParameters<EditorConstructor>) {
+					super(...args, { complete: async snapshot => {
+						calls.push(snapshot);
+						return calls.length === 1 ? pending.promise : "detailed suggestion";
+					} });
+				}
+			};
+		};
+		const skillsLayer: EditorLayer = Base => class extends Base {
+			#dismissed = false;
+			override isShowingAutocomplete(): boolean {
+				return (!this.#dismissed && this.getText().endsWith("$sk")) || super.isShowingAutocomplete();
+			}
+			override render(width: number): readonly string[] {
+				const lines = super.render(width);
+				return this.isShowingAutocomplete() ? [...lines, "skill: $skill"] : lines;
+			}
+			override handleInput(data: string): void {
+				if (this.isShowingAutocomplete() && data === "\x1b") {
+					this.#dismissed = true;
+					return;
+				}
+				if (this.getText().endsWith("$sk") && data === "\t") {
+					this.setText(this.getText().replace(/\$sk$/, "$skill "));
+					return;
+				}
+				super.handleInput(data);
+			}
+		};
+		const layers = promptFirst ? [promptLayer, skillsLayer] : [skillsLayer, promptLayer];
+		const Editor = layers.reduce((Base, layer) => layer(Base), CustomEditor as EditorConstructor);
+		const tui = new TUI(new ProcessTerminal());
+		restores.push(spyOn(tui, "requestRender").mockImplementation(() => {}));
+		const editor = new Editor(tui, getEditorTheme(), getKeybindings()) as PromptAutocompleteEditor;
+		editors.push(editor);
+		editor.setSpellingFeatures({ typoDetection: false, autocorrect: false, autocomplete: "off" });
+		editor.focused = true;
+		editor.render(100);
+		await debounce();
+		editor.setAgentBusy(true);
+		pending.resolve("stale");
+		await settle();
+		expect(screen(editor)).not.toContain("stale");
+		editor.setAgentBusy(false);
+		editor.render(100);
+		await debounce();
+		expect(screen(editor)).toContain("detailed suggestion");
+		editor.setText("Use $sk");
+		expect(screen(editor)).toContain("skill: $skill");
+		await debounce();
+		expect(calls).toHaveLength(2);
+		editor.handleInput("\t");
+		expect(editor.getText()).toBe("Use $skill ");
+		editor.setText("Use $sk");
+		const popupJob = editor.beginRefine()!;
+		editor.handleInput("\x1b");
+		expect(popupJob.signal.aborted).toBe(false);
+		editor.handleInput("\x1b");
+		expect(popupJob.signal.aborted).toBe(true);
+		editor.setText("Use $skill ");
+		editor.setAutocompleteEnabled(false);
+		const job = editor.beginRefine()!;
+		expect(job.apply("Refined prompt")).toBe(true);
+		editor.handleInput("\x1b");
+		expect(editor.getText()).toBe("Use $skill ");
+		editor.dispose();
+		expect(editor.beginRefine()).toBeUndefined();
+	});
+}

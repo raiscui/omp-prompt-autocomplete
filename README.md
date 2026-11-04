@@ -1,8 +1,19 @@
 # omp-prompt-autocomplete
 
+## Changes from upstream
+
+This version modifies [n0uur/omp-prompt-autocomplete](https://github.com/n0uur/omp-prompt-autocomplete):
+
+- When the editor is empty and recent conversation context is available, suggest a detailed next instruction. Show the suggestion as a wrapped preview below the editor; do not generate while the agent is running.
+- When the user is typing, retain the original short inline continuation. Empty-editor requests use a 1,024-token budget and a 15-second deadline; typed-draft requests retain 96 tokens and a 4-second deadline.
+- Compose the prompt editor with the compatible modified `pi-omp-skills-autocomplete` editor in either load order. The `$skill` menu has priority.
+- The original `Alt+E` prompt refinement remains available. No agent model, provider, or credentials are changed by these modifications.
+
+The npm installation command below installs the upstream package, not necessarily this modified version. To use these changes, clone this repository and link the checkout as described below.
+
 AI help for the oh-my-pi (`omp`) prompt box:
 
-- **Ghost-text autocomplete.** Pause while typing and a short continuation appears in dim text. Accept all of it, or one word at a time.
+- **Ghost-text autocomplete.** An empty editor suggests a detailed next instruction based on recent conversation; while typing, a short continuation appears. Accept all of it, or one word at a time.
 - **One-key prompt refine.** Press **Alt+E**, pick an instruction ("Polish", "Make it concise", …) or type your own, and the draft is rewritten in place before you send it. Pressing **Enter** always sends the text exactly as it is in the editor.
 
 Both features use small, fast models through omp's own providers and logins. The agent's model, roles and thinking level are never touched.
@@ -37,7 +48,9 @@ Restart omp afterwards. Requirements: omp 18.4 or newer, and a login for the mod
 
 Word-at-a-time acceptance uses Unicode word segmentation, so languages written without spaces between words (Thai, Japanese, Chinese) advance one dictionary word at a time. Punctuation stays attached to the word before it (`requests.`), and the rest of the suggestion stays on screen without a new request.
 
-Suggestions appear only at the end of a line. Native menus, spelling, `/` commands, `!` shell lines, `@`/`^` mentions and path completion keep priority.
+Suggestions appear only at the end of a line. An empty editor needs recent conversation context and never generates while the agent is running. Detailed suggestions are shown as a wrapped preview below the editor. Native menus, spelling, `/` commands, `!` shell lines, `@`/`^` mentions and path completion keep priority.
+
+When `pi-omp-skills-autocomplete` is installed with the compatible local editor-layer implementation, both plugins compose their editor behavior regardless of load order. The `$skill` menu retains priority over prompt ghost text.
 
 ## Refine
 
@@ -115,14 +128,14 @@ If no model is available, for example because you are not logged in, autocomplet
 
 **Autocomplete** makes one request after a 180 ms typing pause. Each request contains:
 
-- a fixed system prompt;
+- a system prompt chosen for an empty editor or a typed draft;
 - up to 2,048 characters before the cursor and 512 after it;
 - background, unless `/autocomplete context off` is set:
   - the project folder and session name;
   - up to 10 file paths from the agent's recent `read`/`write`/`edit` calls (paths only, never file contents);
   - the last 4 conversation turns, about 1.5 KB in total.
 
-Thinking blocks, tool output, images and `<system-reminder>` blocks are never sent. Requests use at most 96 output tokens, temperature 0 and a 4-second deadline. A reply that arrives after the text has changed is discarded.
+Thinking blocks, tool output, images and `<system-reminder>` blocks are never sent. Typed-draft requests use at most 96 output tokens and a 4-second deadline. Empty-editor requests use at most 1,024 tokens and a 15-second deadline, and require recent conversation context. Both use temperature 0; replies for changed text are discarded. Empty-editor suggestions are single-line, capped at 1,200 UTF-16 code units; typed suggestions remain capped at 160 displayed code units.
 
 **Refine** sends the whole draft once, up to 16,000 characters, together with your instruction, the list of protected placeholders and the same optional background. Refine has a 30-second deadline, and the output budget grows with the draft length up to 8,192 tokens. The reply must be wrapped in `<prompt>…</prompt>`. Terminal control characters are removed and nothing is executed.
 
