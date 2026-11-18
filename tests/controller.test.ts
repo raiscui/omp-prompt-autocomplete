@@ -5,18 +5,18 @@ import { CompletionController } from "../src/controller";
 interface PendingCall {
 	readonly snapshot: CompletionSnapshot;
 	readonly signal: AbortSignal;
-	resolve(value: string | null): void;
+	resolve(value: string | readonly string[] | null): void;
 	reject(error: unknown): void;
 }
 
 function createCompleter(): {
 	calls: PendingCall[];
-	complete: (snapshot: CompletionSnapshot, signal: AbortSignal) => Promise<string | null>;
+	complete: (snapshot: CompletionSnapshot, signal: AbortSignal) => Promise<readonly string[]>;
 } {
 	const calls: PendingCall[] = [];
-	const complete = (snapshot: CompletionSnapshot, signal: AbortSignal): Promise<string | null> => {
-		const { promise, resolve, reject } = Promise.withResolvers<string | null>();
-		calls.push({ snapshot: { ...snapshot }, signal, resolve, reject });
+	const complete = (snapshot: CompletionSnapshot, signal: AbortSignal): Promise<readonly string[]> => {
+		const { promise, resolve, reject } = Promise.withResolvers<readonly string[]>();
+		calls.push({ snapshot: { ...snapshot }, signal, resolve: value => resolve(typeof value === "string" ? [value] : value ?? []), reject });
 		return promise;
 	};
 	return { calls, complete };
@@ -348,46 +348,43 @@ test("null snapshots cancel work, hide the ghost, and repeat as a no-op", async 
 	expect(controller.getSuggestion(at("hi"))).toBeNull();
 });
 
-test("caps the shown suggestion without splitting surrogate pairs and keeps projecting past the cap", async () => {
+test("returns suggestions whole while the ghost stays one capped line, and keeps projecting", async () => {
 	vi.useFakeTimers();
 	const fake = createCompleter();
 	const controller = new CompletionController({ complete: fake.complete, onUpdate: () => {}, debounceMs: 0 });
 
 	controller.update(at("x"));
 	await fireDebounce();
-	fake.calls[0].resolve(`${"a".repeat(159)}\u{1F600}tail`);
+	const full = `${"a".repeat(159)}\u{1F600}tail\nsecond line`;
+	fake.calls[0].resolve(full);
 	await settle();
 
-	const ghost = controller.getSuggestion(at("x")) as string;
+	expect(controller.getSuggestions(at("x"))).toEqual([full]);
+	expect(controller.getSuggestion(at("x"))).toBe(full);
+	const ghost = controller.getGhost(at("x")) as string;
 	expect(ghost.length).toBe(159);
 	expect(ghost).toBe("a".repeat(159));
+	expect(ghost).not.toContain("\n");
 
+	// Typing through the suggestion projects the full remainder, past the ghost cap.
 	const typed = `x${"a".repeat(159)}`;
 	controller.update(at(typed));
-	expect(controller.getSuggestion(at(typed))).toBe("\u{1F600}tail");
+	expect(controller.getSuggestions(at(typed))).toEqual([`\u{1F600}tail\nsecond line`]);
+	expect(controller.getGhost(at(typed))).not.toBeNull();
+	await fireDebounce();
+	expect(fake.calls.length).toBe(1);
 });
 
-test("empty basis keeps its detailed limit while projecting and divergent input returns to the short limit", async () => {
+test("the ghost backs off to the last word boundary when it sits late in the cap", async () => {
 	vi.useFakeTimers();
 	const fake = createCompleter();
 	const controller = new CompletionController({ complete: fake.complete, onUpdate: () => {}, debounceMs: 0 });
-	const detailed = `first ${"a".repeat(1300)}`;
 	controller.update(at(""));
 	await fireDebounce();
-	expect(fake.calls[0].snapshot).toEqual(at(""));
-	fake.calls[0].resolve(detailed);
+	fake.calls[0].resolve(`${"a".repeat(150)} bbbbbbbbbbbbbbbbbbbbbbbbb`);
 	await settle();
-	expect(controller.getSuggestion(at(""))).toBe(detailed.slice(0, 1200));
-	controller.update(at("first "));
-	expect(controller.getSuggestion(at("first "))).toBe(detailed.slice(6, 1200));
-	await fireDebounce();
-	expect(fake.calls.length).toBe(1);
-	controller.update(at("different"));
-	await fireDebounce();
-	expect(fake.calls.length).toBe(2);
-	fake.calls[1].resolve("b".repeat(300));
-	await settle();
-	expect(controller.getSuggestion(at("different"))).toBe("b".repeat(160));
+	expect(controller.getGhost(at(""))).toBe("a".repeat(150));
+	expect(controller.getSuggestions(at("")).length).toBe(1);
 });
 
 test("reset cancels old work, clears dismissals and allows the same snapshot in a new context", async () => {
@@ -433,4 +430,27 @@ test("reset permits reentrant synchronization without recursively scheduling dup
 	fake.calls[1].resolve("fresh");
 	await settle();
 	expect(controller.getSuggestion(at(""))).toBe("fresh");
+});
+
+test("候选分别投影, 分支收窄后退格恢复, 全部耗尽才重新请求", async () => {
+	vi.useFakeTimers();
+	const fake = createCompleter();
+	const controller = new CompletionController({ complete: fake.complete, onUpdate: () => {}, debounceMs: 0 });
+	controller.update(at("he"));
+	await fireDebounce();
+	fake.calls[0].resolve(["llo", "lp", "llo there"]);
+	await settle();
+	expect(controller.getSuggestions(at("he"))).toEqual(["llo", "lp", "llo there"]);
+	controller.update(at("hell"));
+	expect(controller.getSuggestions(at("hell"))).toEqual(["o", "o there"]);
+	controller.update(at("hello"));
+	expect(controller.getSuggestions(at("hello"))).toEqual([" there"]);
+	await fireDebounce();
+	expect(fake.calls.length).toBe(1);
+	controller.update(at("hel"));
+	expect(controller.getSuggestions(at("hel"))).toEqual(["lo", "p", "lo there"]);
+	controller.update(at("help"));
+	expect(controller.getSuggestions(at("help"))).toEqual([]);
+	await fireDebounce();
+	expect(fake.calls.length).toBe(2);
 });

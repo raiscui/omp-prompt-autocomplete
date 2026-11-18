@@ -9,7 +9,8 @@ import {
 	TUI,
 } from "@oh-my-pi/pi-tui";
 import { CustomEditor } from "@oh-my-pi/pi-tui/prompt/custom-editor";
-import type { CompletionSnapshot } from "../src/client";
+import type { AssistantMessage } from "@oh-my-pi/pi-ai";
+import { type CompletionPurpose, type CompletionSnapshot, completeSnapshot } from "../src/client";
 import {
 	createPromptAutocompleteEditor,
 	type EditorConstructor,
@@ -47,13 +48,19 @@ afterEach(() => {
 });
 
 function createEditor(
-	complete: (snapshot: CompletionSnapshot, signal: AbortSignal) => Promise<string | null>,
+	complete: (snapshot: CompletionSnapshot, signal: AbortSignal, purpose?: CompletionPurpose) => Promise<string | readonly string[] | null>,
 	options: Omit<PromptAutocompleteEditorOptions, "complete"> = {},
 ) {
 	const tui = new TUI(new ProcessTerminal());
 	// No terminal ownership or scheduler is needed for direct native editor rendering.
 	restores.push(spyOn(tui, "requestRender").mockImplementation(() => {}));
-	const editor = new PromptAutocompleteEditor(tui, getEditorTheme(), getKeybindings(), { complete, ...options });
+	const editor = new PromptAutocompleteEditor(tui, getEditorTheme(), getKeybindings(), {
+		complete: async (snapshot, signal, purpose) => {
+			const result = await complete(snapshot, signal, purpose);
+			return typeof result === "string" ? [result] : result ?? [];
+		},
+		...options,
+	});
 	editor.setSpellingFeatures({ typoDetection: false, autocorrect: false, autocomplete: "off" });
 	editor.focused = true;
 	editors.push(editor);
@@ -61,7 +68,8 @@ function createEditor(
 }
 
 async function settle() {
-	for (let i = 0; i < 8; i++) await Promise.resolve();
+	// The real request path adds hops (backend await, deadline bookkeeping); 16 microtasks settle it.
+	for (let i = 0; i < 16; i++) await Promise.resolve();
 }
 
 async function debounce() {
@@ -82,17 +90,148 @@ function screen(editor: PromptAutocompleteEditor) {
 	return stripVTControlCharacters(editor.render(100).join("\n").replaceAll(CURSOR_MARKER, ""));
 }
 
-test("native Tab accepts a phrase and punctuation consumes its provisional space", async () => {
+test("Tab opens suggestions and Enter inserts without sending", async () => {
 	const editor = createEditor(async () => "the failure path");
+	const sent: string[] = [];
+	editor.onSubmit = text => { sent.push(text); };
 	editor.setText("Explain ");
 	editor.render(100);
 	await debounce();
-	expect(screen(editor)).toContain("the failure path");
-	expect(editor.getText()).toBe("Explain ");
 	editor.handleInput("\t");
-	expect(editor.getText()).toBe("Explain the failure path ");
-	editor.handleInput(".");
-	expect(editor.getText()).toBe("Explain the failure path.");
+	expect(editor.getText()).toBe("Explain ");
+	expect(screen(editor)).toContain("the failure path");
+	editor.handleInput("\r");
+	expect(editor.getText()).toBe("Explain the failure path");
+	expect(sent).toEqual([]);
+});
+
+test("手动激活立即请求并重新打开被忽略的建议, Enter 只插入候选", async () => {
+	let calls = 0;
+	const editor = createEditor(async () => [`candidate ${++calls}`, "another direction"]);
+	const sent: string[] = [];
+	editor.onSubmit = text => { sent.push(text); };
+	editor.setText("Explain ");
+	editor.triggerAutocomplete();
+	expect(calls).toBe(1);
+	await settle();
+	expect(screen(editor)).toContain("› candidate 1");
+	editor.handleInput("\x1b");
+	editor.handleInput("\x1b");
+	expect(screen(editor)).not.toContain("candidate 1");
+	editor.triggerAutocomplete();
+	expect(calls).toBe(2);
+	await settle();
+	expect(screen(editor)).toContain("› candidate 2");
+	editor.handleInput("\x1b[B");
+	editor.handleInput("\r");
+	expect(editor.getText()).toBe("Explain another direction");
+	expect(sent).toEqual([]);
+});
+
+test("重复手动激活取消旧请求, 空框只展示最新候选", async () => {
+	const first = deferred();
+	const signals: AbortSignal[] = [];
+	const editor = createEditor(async (_snapshot, signal) => {
+		signals.push(signal);
+		return signals.length === 1 ? first.promise : "new direction";
+	});
+	editor.triggerAutocomplete();
+	expect(screen(editor)).toContain("正在获取建议");
+	editor.triggerAutocomplete();
+	expect(signals[0].aborted).toBe(true);
+	await settle();
+	first.resolve("stale direction");
+	await settle();
+	expect(screen(editor)).toContain("› new direction");
+	expect(screen(editor)).not.toContain("stale direction");
+	expect(editor.getText()).toBe("");
+});
+
+test("手动激活遵守关闭状态, Agent 忙碌状态及原生补全优先级", async () => {
+	const snapshots: CompletionSnapshot[] = [];
+	const editor = createEditor(async snapshot => {
+		snapshots.push(snapshot);
+		return "suggestion";
+	});
+	editor.setAutocompleteEnabled(false);
+	editor.triggerAutocomplete();
+	editor.setAgentBusy(true);
+	editor.setAutocompleteEnabled(true);
+	editor.setText("/help");
+	editor.triggerAutocomplete();
+	editor.setAgentBusy(false);
+	for (const draft of ["/help", "!pwd", "$skill", "@file"]) {
+		editor.setText(draft);
+		editor.triggerAutocomplete();
+	}
+	await debounce();
+	expect(snapshots).toEqual([]);
+});
+
+test("候选列表上下切换，渲染与原生描述一致且仅插入选中项", async () => {
+	for (const draft of ["", "Explain "]) {
+		const editor = createEditor(async () => ["first direction", "second direction", "third direction"]);
+		const sent: string[] = [];
+		editor.onSubmit = text => { sent.push(text); };
+		editor.setText(draft);
+		editor.render(100);
+		await debounce();
+		editor.handleInput("\t");
+		editor.handleInput("\x1b[B");
+		const rendered = screen(editor);
+		const described = JSON.stringify(editor.describe({ cols: 100, reduceMotion: false, dark: true, supports: () => true, feature: () => false }));
+		for (const text of ["first direction", "second direction", "third direction"]) {
+			expect(rendered).toContain(text);
+			expect(described).toContain(text);
+		}
+		expect(rendered).toContain("› second direction");
+		editor.handleInput("\x1b[A");
+		editor.handleInput("\x1b[A");
+		editor.handleInput("\r");
+		expect(editor.getText()).toBe(`${draft}third direction`);
+		expect(sent).toEqual([]);
+	}
+});
+
+test("等待时打开列表，Escape 关闭列表而不取消建议", async () => {
+	const result = deferred();
+	const editor = createEditor(async () => result.promise);
+	let interrupts = 0;
+	editor.onEscape = () => { interrupts++; };
+	editor.setText("Explain ");
+	editor.render(100);
+	await debounce();
+	editor.handleInput("\t");
+	expect(screen(editor)).toContain("正在获取建议");
+	expect(JSON.stringify(editor.describe({ cols: 100, reduceMotion: false, dark: true, supports: () => true, feature: () => false }))).toContain("正在获取建议");
+	editor.handleInput("\r");
+	expect(editor.getText()).toBe("Explain ");
+	editor.handleInput("\x1b");
+	expect(interrupts).toBe(0);
+	expect(screen(editor)).not.toContain("正在获取建议");
+	result.resolve("the result");
+	await settle();
+	editor.handleInput("\t");
+	expect(screen(editor)).toContain("the result");
+});
+
+test("输入改变后关闭列表且旧响应不能进入新快照", async () => {
+	const old = deferred();
+	const editor = createEditor(async snapshot => snapshot.prefix === "Explain " ? old.promise : ["new direction", "another direction"]);
+	editor.setText("Explain ");
+	editor.render(100);
+	await debounce();
+	editor.handleInput("\t");
+	editor.handleInput("x");
+	old.resolve("stale direction");
+	await settle();
+	await debounce();
+	expect(screen(editor)).not.toContain("stale direction");
+	expect(screen(editor)).not.toContain("another direction");
+	editor.handleInput("\t");
+	expect(screen(editor)).toContain("another direction");
+	editor.handleInput("\r");
+	expect(editor.getText()).toBe("Explain xnew direction");
 });
 
 test("right arrow inserts the exact code suffix without a space", async () => {
@@ -225,7 +364,7 @@ test("reenabling completion permits a fresh result for the unchanged draft", asy
 test("commands, shell drafts, mentions, and paths never start local inference", async () => {
 	let calls = 0;
 	const editor = createEditor(async () => { calls++; return "unexpected"; });
-	for (const draft of ["   ", "/model gem", "  !git status", "Read @src", "Ask ^gemma", "Use $", "Use $skill", "$skill", "Read ./src", "Read src/file", "Read C:\\src", "Use /skill"]) {
+	for (const draft of ["/model gem", "  !git status", "Read @src", "Ask ^gemma", "Use $", "Use $skill", "$skill", "Read ./src", "Read src/file", "Read C:\\src", "Use /skill"]) {
 		editor.setText(draft);
 		editor.render(100);
 		await debounce();
@@ -268,6 +407,7 @@ test("a native file menu cancels pending ghost work and keeps Tab selection prec
 	editor.setText("Read ");
 	editor.render(100);
 	await debounce();
+	editor.setText("Read ./");
 	editor.handleInput("\t");
 	await settle();
 	expect(editor.isShowingAutocomplete()).toBe(true);
@@ -361,30 +501,47 @@ test("Ctrl+Right accepts the ghost one word at a time without refetching", async
 	expect(editor.getText()).toBe("Please add error handling for failed API requests.");
 });
 
-test("an empty editor requests a detailed suggestion and accepts the full remainder after one word", async () => {
+test("an empty editor shows a one-line ghost, accepts a word, and inserts the full candidate from the list", async () => {
 	const snapshots: CompletionSnapshot[] = [];
 	const suggestion = `First ${"detail ".repeat(40)}done.`;
-	const editor = createEditor(async snapshot => {
+	const background = { cwd: "/repo", recentFiles: [], recentTurns: [{ role: "user" as const, text: "请继续." }] };
+	const editor = createEditor((snapshot, signal, purpose) => {
 		snapshots.push(snapshot);
-		return suggestion;
+		// The real seam echoes the draft; the client strips it back to insert text.
+		return completeSnapshot(async () => ({
+			role: "assistant",
+			content: [{ type: "text", text: `<ins>${suggestion}</ins>` }],
+			api: "google-gemini-cli",
+			provider: "google-antigravity",
+			model: "gemini-3.1-flash-lite",
+			stopReason: "stop",
+			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+			timestamp: Date.now(),
+		} as AssistantMessage), snapshot, signal, { background, purpose });
 	});
 	editor.placeholder = () => "placeholder";
 	editor.nativePlaceholder = "placeholder";
 	editor.render(100);
 	await debounce();
 	expect(snapshots).toEqual([{ prefix: "", suffix: "" }]);
-	expect(screen(editor)).toContain("done.");
+	const ghostRows = screen(editor).split("\n").filter(row => row.includes("建议:"));
+	expect(ghostRows.length).toBeGreaterThan(0);
+	for (const row of ghostRows) expect(row.length).toBeLessThanOrEqual("建议: ".length + 160);
+	expect(screen(editor)).toContain("First");
+	expect(screen(editor)).not.toContain("done.");
 	const native = editor.describe({ cols: 40, reduceMotion: false, dark: true, supports: () => true, feature: () => false });
-	expect(JSON.stringify(native)).toContain("done.");
+	expect(JSON.stringify(native)).toContain("First");
 	editor.handleInput(CTRL_RIGHT);
 	expect(editor.getText()).toBe("First");
 	await debounce();
 	expect(snapshots.length).toBe(1);
-	editor.handleInput("\x1b[C");
+	editor.handleInput("\t");
+	await settle();
+	editor.handleInput("\r");
 	expect(editor.getText()).toBe(suggestion);
 });
 
-test("placeholder does not prevent Tab or right arrow from accepting an empty-draft suggestion", async () => {
+test("placeholder does not prevent opening a suggestion; the list inserts it all and the arrow only the ghost line", async () => {
 	for (const key of ["\t", "\x1b[C"]) {
 		const suggestion = `完整建议 ${"内容".repeat(100)}`;
 		const editor = createEditor(async () => suggestion);
@@ -393,11 +550,52 @@ test("placeholder does not prevent Tab or right arrow from accepting an empty-dr
 		editor.render(80);
 		await debounce();
 		editor.handleInput(key);
-		expect(editor.getText()).toBe(key === "\t" ? `${suggestion} ` : suggestion);
+		if (key === "\t") {
+			expect(editor.getText()).toBe("");
+			editor.handleInput("\r");
+			expect(editor.getText()).toBe(suggestion);
+		} else {
+			expect(editor.getText().length).toBeGreaterThan(0);
+			expect(editor.getText().length).toBeLessThanOrEqual(160);
+			expect(suggestion.startsWith(editor.getText())).toBe(true);
+		}
 	}
 });
 
-test("whitespace-only drafts do not request an empty-context suggestion", async () => {
+test("Ctrl/Cmd+Shift+Right 主动激活候选, 选中后只插入而不发送", async () => {
+	for (const key of ["\x1b[1;6C", "\x1b[1;10C"]) {
+		const editor = createEditor(async () => ["first direction", "second direction"]);
+		const sent: string[] = [];
+		editor.onSubmit = text => { sent.push(text); };
+		editor.handleInput(key);
+		await settle();
+		expect(editor.getText()).toBe("");
+		expect(screen(editor)).toContain("› first direction");
+		editor.handleInput("\x1b[B");
+		editor.handleInput("\r");
+		expect(editor.getText()).toBe("second direction");
+		expect(sent).toEqual([]);
+	}
+});
+
+test("Ctrl+Shift+Right 在逐词接受后根据当前输入重新请求, 不直接填入旧建议", async () => {
+	const snapshots: CompletionSnapshot[] = [];
+	const editor = createEditor(async snapshot => {
+		snapshots.push(snapshot);
+		return snapshots.length === 1 ? "First direction" : " updated direction";
+	});
+	editor.render(80);
+	await debounce();
+	editor.handleInput(CTRL_RIGHT);
+	expect(editor.getText()).toBe("First");
+	editor.handleInput("\x1b[1;6C");
+	await settle();
+	expect(snapshots).toEqual([{ prefix: "", suffix: "" }, { prefix: "First", suffix: "" }]);
+	expect(editor.getText()).toBe("First");
+	expect(screen(editor)).toContain("›  updated direction");
+});
+
+test("whitespace-only drafts are the empty-editor state, not an ineligible snapshot", async () => {
 	const snapshots: CompletionSnapshot[] = [];
 	const editor = createEditor(async snapshot => {
 		snapshots.push(snapshot);
@@ -406,7 +604,12 @@ test("whitespace-only drafts do not request an empty-context suggestion", async 
 	editor.setText("   ");
 	editor.render(100);
 	await debounce();
-	expect(snapshots).toEqual([]);
+	expect(snapshots).toEqual([{ prefix: "", suffix: "" }]);
+	editor.handleInput("\t");
+	await settle();
+	expect(screen(editor)).toContain("› suggestion");
+	editor.handleInput("\r");
+	expect(editor.getText()).toBe("suggestion");
 });
 
 test("agent busy cancels old requests and resets dismissals before generating for the next turn", async () => {
@@ -604,7 +807,8 @@ for (const promptFirst of [true, false]) {
 				constructor(...args: ConstructorParameters<EditorConstructor>) {
 					super(...args, { complete: async snapshot => {
 						calls.push(snapshot);
-						return calls.length === 1 ? pending.promise : "detailed suggestion";
+						const result = calls.length === 1 ? await pending.promise : "detailed suggestion";
+						return result ? [result] : [];
 					} });
 				}
 			};

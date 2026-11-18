@@ -1,9 +1,10 @@
 import { completeSimple, type Model } from "@oh-my-pi/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type { KeyId } from "@oh-my-pi/pi-tui";
-import { type CompletionSnapshot, completeSnapshot, completionSettings } from "./client";
+import { type CompletionPurpose, type CompletionSnapshot, completeSnapshot, completionSettings } from "./client";
 import { collectPromptContext } from "./context";
 import {
+	AUTOCOMPLETE_KEYS,
 	createPromptAutocompleteEditor,
 	EDITOR_LAYERS,
 	type EditorConstructor,
@@ -13,6 +14,7 @@ import {
 } from "./editor";
 import { type PickerResult, RefinePicker } from "./picker";
 import { REFINE_PRESETS, RefineError, refineDraft } from "./refine";
+import { completionRouteContext, completionSkillContext } from "./scenarios";
 
 /**
  * Inline ghost-text suggestions and one-key prompt refinement for the main prompt editor,
@@ -102,25 +104,35 @@ export default function promptAutocomplete(pi: ExtensionAPI): void {
 		return "default";
 	}
 
-	function complete(ctx: ExtensionContext, snapshot: CompletionSnapshot, signal: AbortSignal): Promise<string | null> {
-		const { model } = resolveModel(ctx, "autocomplete");
-		const sessionId = ctx.sessionManager.getSessionId();
+	function complete(ctx: ExtensionContext, snapshot: CompletionSnapshot, signal: AbortSignal, purpose?: CompletionPurpose): Promise<readonly string[]> {
 		const background = withContext ? collectPromptContext(ctx.sessionManager, ctx.cwd) : undefined;
+		const skills = withContext ? pi.pi.getActiveSkills() : [];
+		const skillContext = withContext ? completionSkillContext(skills, background, snapshot.prefix + snapshot.suffix) : undefined;
+		const empty = snapshot.prefix === "" && snapshot.suffix === "";
+		const hidden = new Set(skills.filter(skill => skill.hide).map(skill => `skill:${skill.name}`));
+		const routes = withContext && empty
+			? completionRouteContext(pi.getCommands().filter(command => command.source !== "skill" || !hidden.has(command.name)), background)
+			: undefined;
+		const settings = completionSettings(snapshot, purpose);
 		return completeSnapshot(
-			(context, requestSignal) =>
-				completeSimple(model, context, {
+			// Model resolution is lazy: a request with no task basis must not resolve a model at all.
+			(context, requestSignal) => {
+				const { model } = resolveModel(ctx, "autocomplete");
+				const sessionId = ctx.sessionManager.getSessionId();
+				return completeSimple(model, context, {
 					apiKey: ctx.modelRegistry.resolver(model, sessionId),
 					sessionId,
-					maxTokens: completionSettings(snapshot).maxTokens,
+					maxTokens: settings.maxTokens,
 					temperature: 0,
 					// Clamped to the model's lowest effort where reasoning cannot be switched off.
 					disableReasoning: true,
 					hideThinkingSummary: true,
 					signal: requestSignal,
-				}),
+				});
+			},
 			snapshot,
 			signal,
-			{ background },
+			{ background, skillContext, routes, purpose },
 		);
 	}
 
@@ -252,7 +264,7 @@ export default function promptAutocomplete(pi: ExtensionAPI): void {
 				constructor(...args: ConstructorParameters<EditorConstructor>) {
 					editor?.dispose();
 					super(...args, {
-						complete: (snapshot, signal) => complete(ctx, snapshot, signal),
+						complete: (snapshot, signal, purpose) => complete(ctx, snapshot, signal, purpose),
 						onError: error => reportError(ctx, error),
 						onRefineStateChange: state => showRefineState(ctx, state),
 					});
@@ -283,6 +295,21 @@ export default function promptAutocomplete(pi: ExtensionAPI): void {
 		editor?.dispose();
 		editor = undefined;
 	});
+
+	for (const key of AUTOCOMPLETE_KEYS) {
+		pi.registerShortcut(key, {
+			description: "Request fresh prompt suggestions and open the candidate list",
+			handler: ctx => {
+				if (!ctx.hasUI || ctx.mode !== "tui" || ctx.agent.kind !== "main" || !editor) return;
+				if (!enabled) {
+					ctx.ui.notify(`Prompt autocomplete is off. Run /${COMMAND} on first.`, "info");
+					return;
+				}
+				warned = false;
+				editor.triggerAutocomplete();
+			},
+		});
+	}
 
 	pi.registerShortcut(REFINE_KEY, {
 		description: "Refine the prompt draft with AI (pick an instruction; Enter still sends as-is)",
@@ -345,7 +372,7 @@ export default function promptAutocomplete(pi: ExtensionAPI): void {
 			};
 			ctx.ui.notify(
 				[
-					`Prompt autocomplete ${enabled ? "on" : "off"}: ${describe("autocomplete")}.`,
+					`Prompt autocomplete ${enabled ? "on" : "off"} (Ctrl/Cmd+Shift+Right): ${describe("autocomplete")}.`,
 					`Refine (${keyLabel(REFINE_KEY)}): ${describe("refine")}.`,
 					`Session context ${withContext ? "on" : "off"}. Agent model: ${ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "none"} — unchanged.`,
 				].join(" "),

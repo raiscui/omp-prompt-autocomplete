@@ -2,9 +2,10 @@
  * Debounced, cancellation-safe controller for model ghost-text suggestions.
  *
  * State model: the controller keeps at most one *basis* — the snapshot a completion was
- * generated for plus the completion text itself. Everything else is derived from it, so
+ * generated for plus the full insert texts themselves. Everything else is derived from it, so
  * there is no cache of stale suggestions and nothing can be shown for text that no longer
- * matches.
+ * matches. Display caps never touch this state: the editor derives compact rows and the short
+ * inline ghost from the same full texts.
  *
  * Guarantees:
  *  - `update()` is idempotent for an equal snapshot (and for repeated `null`), so calling it
@@ -20,7 +21,7 @@
  *  - disabling or disposing cancels all work and hides the ghost;
  *  - a failed request is reported once through `onError` and is not retried until new input.
  */
-import { completionSettings, type CompletionSnapshot } from "./client";
+import { MAX_CANDIDATES, type CompletionPurpose, type CompletionSnapshot } from "./client";
 
 export interface CompletionControllerOptions {
 	/** Performs one completion request. Must honour `signal`. */
@@ -33,20 +34,20 @@ export interface CompletionControllerOptions {
 	debounceMs?: number;
 }
 
-export type CompletionRequest = (snapshot: CompletionSnapshot, signal: AbortSignal) => Promise<string | null>;
+/** Third argument is optional; existing two-argument completers keep working. */
+export type CompletionRequest = (snapshot: CompletionSnapshot, signal: AbortSignal, purpose?: CompletionPurpose) => Promise<readonly string[]>;
 export type CompletionErrorHandler = (error: unknown) => void;
 
 export const DEFAULT_DEBOUNCE_MS = 180;
-/** Maximum number of suggestion characters returned by {@link CompletionController.getSuggestion}. */
-export const MAX_SHOWN_CHARS = 160;
+/** Maximum characters of the one-line inline ghost returned by {@link CompletionController.getGhost}. */
+export const GHOST_MAX_CHARS = 160;
 /** Bounded memory of dismissed snapshots, so Escape twice cannot resurrect old text. */
 const MAX_DISMISSED_KEYS = 16;
 
 interface SuggestionBasis {
 	readonly prefix: string;
 	readonly suffix: string;
-	readonly text: string;
-	readonly maxShownChars: number;
+	readonly texts: readonly string[];
 }
 
 interface InFlightRequest {
@@ -59,8 +60,22 @@ function snapshotKey(snapshot: CompletionSnapshot): string {
 	return `${snapshot.prefix.length}:${snapshot.suffix.length}:${snapshot.prefix}\u0000${snapshot.suffix}`;
 }
 
-/** Cap the shown text without splitting a surrogate pair. */
-function capShown(text: string, maxChars: number): string {
+/** First non-blank line of a multi-line candidate, trailing spaces trimmed. */
+function firstLine(text: string): string {
+	for (const line of text.split(/\r\n|\r|\n/)) {
+		if (line.trim().length > 0) {
+			return line.replace(/\s+$/, "");
+		}
+	}
+	return "";
+}
+
+/**
+ * Cap a single-line ghost without splitting a surrogate pair, backing off to the last space when
+ * that space sits late enough that the cut would otherwise land inside a word. Scripts written
+ * without spaces keep the hard cap.
+ */
+function capOnWordBoundary(text: string, maxChars: number): string {
 	if (text.length <= maxChars) {
 		return text;
 	}
@@ -69,13 +84,11 @@ function capShown(text: string, maxChars: number): string {
 	if (code >= 0xd800 && code <= 0xdbff) {
 		end -= 1;
 	}
+	const space = text.lastIndexOf(" ", end);
+	if (space > maxChars * 0.7) {
+		end = space;
+	}
 	return text.slice(0, end);
-}
-
-/** Defensive single-line guard: the client already normalises, this protects the renderer. */
-function singleLine(text: string): string {
-	const breakAt = text.search(/[\r\n\u2028\u2029]/);
-	return breakAt === -1 ? text : text.slice(0, breakAt);
 }
 
 export class CompletionController {
@@ -136,7 +149,7 @@ export class CompletionController {
 			return;
 		}
 		const projected = this.project(snapshot);
-		if (projected !== null && projected.length > 0) {
+		if (projected !== null && projected.some(text => text.length > 0)) {
 			// Typing through the current suggestion: the basis still applies, so no request.
 			this.onUpdate();
 			return;
@@ -150,23 +163,50 @@ export class CompletionController {
 		this.onUpdate();
 	}
 
-	/** The suggestion to render for `snapshot`, or `null`. Pure: never triggers a request. */
-	getSuggestion(snapshot: CompletionSnapshot): string | null {
-		if (this.disposed || !this.enabled) {
-			return null;
+	/** 手动请求绕过防抖和当前输入的忽略记录, 仍由 epoch 隔离过期响应. */
+	requestNow(snapshot: CompletionSnapshot, purpose: CompletionPurpose = "list"): void {
+		if (this.disposed || !this.enabled) return;
+		const key = snapshotKey(snapshot);
+		this.cancelWork();
+		// A list request for the text already on screen refines it instead of blanking the panel:
+		// only a basis that no longer matches this snapshot is dropped. The epoch above still
+		// discards whatever was in flight.
+		if (this.basis === null || this.basis.prefix !== snapshot.prefix || this.basis.suffix !== snapshot.suffix) {
+			this.basis = null;
 		}
-		if (this.dismissed.includes(snapshotKey(snapshot))) {
-			return null;
-		}
-		const projected = this.project(snapshot);
-		return projected !== null && projected.length > 0 ? capShown(projected, this.basis!.maxShownChars) : null;
-	}
-	/** 返回由全空输入生成的完整建议余量, 供编辑器单独折行展示. */
-	getDetailedSuggestion(snapshot: CompletionSnapshot): string | null {
-		if (!this.basis || this.basis.prefix !== "" || this.basis.suffix !== "") return null;
-		return this.getSuggestion(snapshot);
+		this.inputKey = key;
+		const dismissedIndex = this.dismissed.indexOf(key);
+		if (dismissedIndex !== -1) this.dismissed.splice(dismissedIndex, 1);
+		void this.runFetch({ ...snapshot }, key, purpose);
+		this.onUpdate();
 	}
 
+	/** 返回当前输入可用的各候选完整插入文本, 不做展示截断. */
+	getSuggestions(snapshot: CompletionSnapshot): readonly string[] {
+		if (this.disposed || !this.enabled || this.inputKey !== snapshotKey(snapshot) || this.dismissed.includes(snapshotKey(snapshot))) {
+			return [];
+		}
+		const projected = this.project(snapshot);
+		return projected === null ? [] : projected.filter(text => text.length > 0);
+	}
+
+	/** The first suggestion remains available to the ghost-text shortcuts, in full. */
+	getSuggestion(snapshot: CompletionSnapshot): string | null {
+		return this.getSuggestions(snapshot)[0] ?? null;
+	}
+
+	/**
+	 * Single-line display form of the first suggestion, at most {@link GHOST_MAX_CHARS} characters.
+	 * The inline ghost and word acceptance use this; the list always uses {@link getSuggestions}.
+	 */
+	getGhost(snapshot: CompletionSnapshot): string | null {
+		const first = this.getSuggestion(snapshot);
+		if (first === null) {
+			return null;
+		}
+		const line = firstLine(first);
+		return line ? capOnWordBoundary(line, GHOST_MAX_CHARS) : null;
+	}
 
 	/**
 	 * Suppress the suggestion for this exact snapshot (and cancel any pending work for it).
@@ -232,19 +272,14 @@ export class CompletionController {
 	 * Remaining suggestion text for `snapshot`, or `null` when it does not continue the basis
 	 * (different suffix, or typing that diverged from the suggestion).
 	 */
-	private project(snapshot: CompletionSnapshot): string | null {
+	private project(snapshot: CompletionSnapshot): string[] | null {
 		const basis = this.basis;
-		if (basis === null || basis.text.length === 0) {
-			return null;
-		}
-		if (snapshot.suffix !== basis.suffix || !snapshot.prefix.startsWith(basis.prefix)) {
+		if (basis === null || snapshot.suffix !== basis.suffix || !snapshot.prefix.startsWith(basis.prefix)) {
 			return null;
 		}
 		const typed = snapshot.prefix.slice(basis.prefix.length);
-		if (typed.length > basis.text.length || !basis.text.startsWith(typed)) {
-			return null;
-		}
-		return basis.text.slice(typed.length);
+		const matching = basis.texts.filter(text => text.startsWith(typed));
+		return matching.length === 0 ? null : matching.map(text => text.slice(typed.length));
 	}
 
 	/** Drop timer and in-flight request, and invalidate any response still on the wire. */
@@ -265,7 +300,7 @@ export class CompletionController {
 		const request = { prefix: snapshot.prefix, suffix: snapshot.suffix };
 		const timer = setTimeout(() => {
 			this.timer = null;
-			void this.runFetch(request, key);
+			void this.runFetch(request, key, "ghost");
 		}, this.debounceMs);
 		// Bun timers expose unref(); DOM typings declare a number.
 		const unref = (timer as unknown as { unref?: () => void }).unref;
@@ -275,16 +310,16 @@ export class CompletionController {
 		this.timer = timer;
 	}
 
-	private async runFetch(snapshot: CompletionSnapshot, key: string): Promise<void> {
+	private async runFetch(snapshot: CompletionSnapshot, key: string, purpose: CompletionPurpose): Promise<void> {
 		if (this.disposed || !this.enabled) {
 			return;
 		}
 		const epoch = this.epoch;
 		const controller = new AbortController();
 		this.inFlight = { epoch, key, controller };
-		let result: string | null;
+		let result: readonly string[];
 		try {
-			result = await this.complete(snapshot, controller.signal);
+			result = await this.complete(snapshot, controller.signal, purpose);
 		} catch (error) {
 			if (this.inFlight !== null && this.inFlight.controller === controller) {
 				this.inFlight = null;
@@ -307,17 +342,13 @@ export class CompletionController {
 			this.onUpdate(); // in-flight request was dismissed; nothing to show
 			return;
 		}
-		const text = typeof result === "string" ? singleLine(result) : "";
-		if (text.trim().length === 0) {
+		const texts = [...new Set(result.filter(text => text.trim().length > 0))].slice(0, MAX_CANDIDATES);
+		if (texts.length === 0) {
 			this.basis = null;
 			this.onUpdate();
 			return;
 		}
-		const maxShownChars = snapshot.prefix === "" && snapshot.suffix === ""
-			? completionSettings(snapshot).maxOutputChars
-			: MAX_SHOWN_CHARS;
-		const basisText = snapshot.prefix === "" && snapshot.suffix === "" ? capShown(text, maxShownChars) : text;
-		this.basis = { prefix: snapshot.prefix, suffix: snapshot.suffix, text: basisText, maxShownChars };
+		this.basis = { prefix: snapshot.prefix, suffix: snapshot.suffix, texts };
 		this.onUpdate();
 	}
 

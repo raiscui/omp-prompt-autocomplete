@@ -2,6 +2,15 @@ import type { Message } from "@oh-my-pi/pi-ai";
 import type { ReadonlySessionManager } from "@oh-my-pi/pi-coding-agent";
 import path from "node:path";
 
+export const TASK_FOCUS_RULES = [
+	"Stay on the user's current core goal, including later changes explicitly agreed by the user. When a current todo list is visible in the background, use its unfinished in-scope items as the main route; plans and todos do not independently authorise more scope.",
+	"Prefer the next step that closes an actual delivery gap. Include supporting work only when omitting it would block the current requirement, correctness, safety or necessary acceptance; being related to the goal is not enough.",
+	"Avoid over-defensive additions for hypothetical risks: do not invent extra validation, fallback paths, retries, compatibility, refactoring, infrastructure, documentation or broader tests. Preserve the user's explicit requirements, applicable constraints and necessary safety and acceptance checks.",
+	"Do not turn a chosen solution's dependencies, past effort or optional assistant advice into new user requirements. Prefer a simpler complete path over building tools to support other tools.",
+	"If the background shows repeated local fixes without closing the same delivery gap, prefer reassessing that specific cause or approach and the smallest discriminating check, not more patches or a broad rewrite.",
+	"When the agreed delivery and necessary acceptance are complete, do not invent follow-up tasks or extra polish to keep going; an empty autocomplete suggestion is appropriate. Do not claim completion without evidence or lower acceptance to stop early.",
+].join("\n");
+
 /**
  * Background the model may use to guess better: where the user is working, what was just
  * discussed, and which files the agent touched. Everything is bounded and drawn only from the

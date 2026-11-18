@@ -4,6 +4,7 @@ import {
 	type EditorTheme,
 	type KeybindingsManager,
 	matchesKey,
+	truncateToWidth,
 	type TUI,
 	wrapTextWithAnsi,
 } from "@oh-my-pi/pi-tui";
@@ -53,9 +54,29 @@ interface ActiveRefine {
 	readonly controller: AbortController;
 }
 
+/** Open candidate panel. Rows and the preview are derived from the controller's full texts. */
+interface CandidateMenu {
+	readonly snapshot: CompletionSnapshot;
+	/** Editor text when the menu opened; any change retires the menu. */
+	readonly draft: string;
+	selectedIndex: number;
+	previewOffset: number;
+}
+
 export type EditorConstructor = new (tui: TUI, theme: EditorTheme, keybindings: KeybindingsManager) => CustomEditor;
 export type EditorLayer = (Base: EditorConstructor) => EditorConstructor;
 export const EDITOR_LAYERS = Symbol.for("omp.editor.layers.v1");
+export const AUTOCOMPLETE_KEYS = ["ctrl+shift+right", "super+shift+right"] as const;
+
+/** First non-blank line of a candidate for a compact list row; leading insert spaces survive. */
+function compactRow(text: string): string {
+	for (const line of text.split(/\r\n|\r|\n/)) {
+		if (line.trim().length > 0) {
+			return line.replace(/\s+$/, "");
+		}
+	}
+	return "";
+}
 
 /** 保留宿主编辑器行为, 同时允许其他编辑器层参与继承链. */
 export const createPromptAutocompleteEditor = (Base: EditorConstructor) => class PromptAutocompleteEditor extends Base {
@@ -68,6 +89,7 @@ export const createPromptAutocompleteEditor = (Base: EditorConstructor) => class
 	#autocompleteProvider?: AutocompleteProvider;
 	#refining: ActiveRefine | null = null;
 	#refined: { original: string; refined: string } | null = null;
+	#menu: CandidateMenu | null = null;
 
 	constructor(tui: TUI, theme: EditorTheme, keybindings: KeybindingsManager, options: PromptAutocompleteEditorOptions) {
 		super(tui, theme, keybindings);
@@ -93,7 +115,7 @@ export const createPromptAutocompleteEditor = (Base: EditorConstructor) => class
 			getWordReplacements: provider?.getWordReplacements?.bind(provider),
 			getWordCompletion: () => {
 				const snapshot = this.#sync();
-				return snapshot ? this.#controller.getSuggestion(snapshot) : null;
+				return snapshot ? this.#controller.getGhost(snapshot) : null;
 			},
 			wordCompletionFeedback: () => {
 				const snapshot = this.#snapshot();
@@ -116,10 +138,19 @@ export const createPromptAutocompleteEditor = (Base: EditorConstructor) => class
 		this.tui?.requestRender();
 	}
 
+	triggerAutocomplete(): void {
+		const snapshot = this.#snapshot();
+		if (!snapshot) return;
+		this.#openMenu(snapshot);
+		this.#controller.requestNow(snapshot, "list");
+		this.#refreshMenu();
+	}
+
 	/** Agent 执行期间隐藏并取消建议; 状态切换时清除旧会话背景. */
 	setAgentBusy(busy: boolean): void {
 		if (this.#disposed || this.#agentBusy === busy) return;
 		this.#agentBusy = busy;
+		this.#menu = null;
 		this.#controller.reset();
 	}
 
@@ -186,6 +217,7 @@ export const createPromptAutocompleteEditor = (Base: EditorConstructor) => class
 		this.cancelRefine();
 		this.#disposed = true;
 		this.#refined = null;
+		this.#menu = null;
 		this.#controller.dispose();
 		this.invalidate();
 		this.tui?.requestRender();
@@ -195,32 +227,72 @@ export const createPromptAutocompleteEditor = (Base: EditorConstructor) => class
 		this.#trackRefineDraft();
 		const snapshot = this.#sync();
 		const lines = super.render(width);
-		const suggestion = snapshot && this.#controller.getDetailedSuggestion(snapshot);
-		if (!suggestion) return lines;
-		return [...lines, ...this.#suggestionRows(suggestion, width).map(line => `\x1b[2m${line}\x1b[0m`)];
+		const rows = snapshot ? this.#displayRows(snapshot, width) : [];
+		if (!rows.length) return lines;
+		return [...lines, ...rows.map(line => `\x1b[2m${line}\x1b[0m`)];
 	}
 
 	override describe(cx: DescribeContext): NativeNode {
 		this.#trackRefineDraft();
 		const snapshot = this.#sync();
 		const root = super.describe(cx);
-		const suggestion = snapshot && this.#controller.getDetailedSuggestion(snapshot);
-		if (!suggestion) return root;
-		return { ...root, c: [...(root.c ?? []), ...this.#suggestionRows(suggestion, cx.cols).map(line => nativeText(line))] };
+		const rows = snapshot ? this.#displayRows(snapshot, cx.cols) : [];
+		return {
+			...root,
+			c: [
+				...(root.c ?? []),
+				...rows.map(line => nativeText(line)),
+			],
+		};
 	}
 
 	#suggestionRows(suggestion: string, width: number): string[] {
 		return wrapTextWithAnsi(`建议: ${suggestion}`, Math.max(1, width));
 	}
 
+	#displayRows(snapshot: CompletionSnapshot, width: number): string[] {
+		if (this.#menu) {
+			const choices = this.#controller.getSuggestions(snapshot);
+			if (!choices.length) return [this.#controller.pending ? "正在获取建议…" : "暂无建议"];
+			const selected = Math.min(this.#menu.selectedIndex, choices.length - 1);
+			const cols = Math.max(1, width);
+			const budget = Math.max(4, Math.min(24, (this.tui?.terminal.rows || 24) - 6));
+			const rows = choices.map((text, index) =>
+				truncateToWidth(`${index === selected ? "›" : " "} ${compactRow(text)}`, cols));
+			rows.push(truncateToWidth(`${selected + 1}/${choices.length} · ↑↓ 选择 · Enter 填入 · Esc 关闭 · PgUp/PgDn 预览`, cols));
+			// The full selected candidate, untruncated, paged with PgUp/PgDn.
+			const preview = wrapTextWithAnsi(`提示词: ${choices[selected]}`, cols);
+			const available = Math.max(1, budget - rows.length);
+			this.#menu.previewOffset = Math.min(this.#menu.previewOffset, Math.max(0, preview.length - available));
+			rows.push(...preview.slice(this.#menu.previewOffset, this.#menu.previewOffset + available));
+			return rows;
+		}
+		const ghost = this.#controller.getGhost(snapshot);
+		return ghost ? this.#suggestionRows(ghost, width) : [];
+	}
+
+	#openMenu(snapshot: CompletionSnapshot): void {
+		this.#menu = { snapshot, draft: this.getText(), selectedIndex: 0, previewOffset: 0 };
+	}
+
+	#refreshMenu(): void {
+		this.invalidate();
+		this.tui?.requestRender();
+	}
+
 	override handleInput(data: string): void {
-		if (this.isShowingAutocomplete()) {
+		if (this.isShowingAutocomplete() || this.isAutocompleteActive()) {
+			this.#menu = null;
 			try {
 				super.handleInput(data);
 			} finally {
 				this.#trackRefineDraft();
 				this.#sync();
 			}
+			return;
+		}
+		if (AUTOCOMPLETE_KEYS.some(key => matchesKey(data, key))) {
+			this.triggerAutocomplete();
 			return;
 		}
 		// Refine owns Escape before the ghost, menus and the agent interrupt: it cancels an
@@ -245,6 +317,50 @@ export const createPromptAutocompleteEditor = (Base: EditorConstructor) => class
 			return;
 		}
 		const snapshot = this.#sync();
+		if (snapshot && this.#menu) {
+			const choices = this.#controller.getSuggestions(snapshot);
+			if (matchesKey(data, "escape")) {
+				this.#menu = null;
+				this.#refreshMenu();
+				return;
+			}
+			if (matchesKey(data, "pageUp") || matchesKey(data, "pageDown")) {
+				this.#menu.previewOffset = Math.max(0, this.#menu.previewOffset + (matchesKey(data, "pageUp") ? -3 : 3));
+				this.#refreshMenu();
+				return;
+			}
+			if (matchesKey(data, "up") || matchesKey(data, "down")) {
+				if (choices.length) {
+					const delta = matchesKey(data, "up") ? -1 : 1;
+					this.#menu.selectedIndex = (this.#menu.selectedIndex + delta + choices.length) % choices.length;
+					this.#menu.previewOffset = 0;
+				}
+				this.#refreshMenu();
+				return;
+			}
+			if (matchesKey(data, "enter")) {
+				const selected = choices[Math.min(this.#menu.selectedIndex, Math.max(0, choices.length - 1))];
+				if (selected !== undefined) {
+					this.#menu = null;
+					// Empty editor: the candidate *is* the message, so replace the (blank) text.
+					// Draft: the candidate is insert text, so it goes at the cursor and never deletes user text.
+					if (!snapshot.prefix && !snapshot.suffix) this.setText(selected);
+					else this.insertText(selected);
+					this.#sync();
+				}
+				this.#refreshMenu();
+				return;
+			}
+		}
+		if (snapshot && matchesKey(data, "tab") &&
+			(!snapshot.prefix && !snapshot.suffix || this.#menu || this.#controller.pending || this.#controller.getSuggestions(snapshot).length > 0)) {
+			this.#openMenu(snapshot);
+			// Explicit activation is always the long send-ready budget; the automatic basis is the
+			// short inline ghost, which is not what Enter into an empty editor should insert.
+			this.#controller.requestNow(snapshot, "list");
+			this.#refreshMenu();
+			return;
+		}
 		// A menu owns Escape before the ghost; the next Escape still reaches the
 		// original CustomEditor interrupt/Vim handling after this snapshot is dismissed.
 		if (snapshot && matchesKey(data, "escape") && this.#controller.dismiss(snapshot)) {
@@ -255,7 +371,7 @@ export const createPromptAutocompleteEditor = (Base: EditorConstructor) => class
 		// Word-right at a shown ghost takes one word of it (Ctrl+→ / Alt+→ / Alt+F by default).
 		// Without a ghost the cursor is at a line end, where native word-right keeps its meaning.
 		if (snapshot && this.#keybindings.matches(data, "tui.editor.cursorWordRight")) {
-			const ghost = this.#controller.getSuggestion(snapshot);
+			const ghost = this.#controller.getGhost(snapshot);
 			if (ghost) {
 				this.insertText(nextWordOf(ghost));
 				this.#sync();
@@ -288,6 +404,9 @@ export const createPromptAutocompleteEditor = (Base: EditorConstructor) => class
 
 	#sync(): CompletionSnapshot | null {
 		const snapshot = this.#snapshot();
+		if (this.#menu && (!snapshot || this.getText() !== this.#menu.draft || snapshot.prefix !== this.#menu.snapshot.prefix || snapshot.suffix !== this.#menu.snapshot.suffix)) {
+			this.#menu = null;
+		}
 		this.#controller.update(snapshot);
 		return snapshot;
 	}
@@ -301,7 +420,7 @@ export const createPromptAutocompleteEditor = (Base: EditorConstructor) => class
 			this.#refining ||
 			this.#refined ||
 			!this.focused ||
-			this.isShowingAutocomplete() ||
+			(this.isShowingAutocomplete() || this.isAutocompleteActive()) ||
 			this.vimMode !== "insert"
 		) {
 			return null;
@@ -312,12 +431,12 @@ export const createPromptAutocompleteEditor = (Base: EditorConstructor) => class
 		if (this.#autocompleteProvider?.getInlineHint?.(lines, line, col)) return null;
 
 		const text = lines.join("\n");
-		if (text === "") return { prefix: "", suffix: "" };
-		if (!text.trim() || /^[\/!]/.test(text.trimStart())) return null;
+		// Whitespace-only text is the same state as an empty editor, whatever the engine knows.
+		if (!text.trim()) return { prefix: "", suffix: "" };
+		if (/^[\/!]/.test(text.trimStart())) return null;
 		let offset = col;
 		for (let i = 0; i < line; i++) offset += lines[i].length + 1;
 		const prefix = text.slice(0, offset);
-		if (!prefix.trim()) return null;
 
 		// Avoid racing file/model mentions and path/skill completion while their
 		// native menu is still loading. Code fences retain ordinary code suffixes.

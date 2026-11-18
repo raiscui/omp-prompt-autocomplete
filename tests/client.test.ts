@@ -58,6 +58,15 @@ async function errorOf(promise: Promise<unknown>): Promise<Error> {
 	throw new Error("expected rejection");
 }
 
+test("empty editor preserves registered invocations and drops unknown commands", async () => {
+	const registered = "/skill:fabric-workflow 分头检查安装和卸载流程，再统一验收。";
+	const { backend } = recording(reply(
+		"<ins>/skill:fabric-workflow-extra 检查安装流程。</ins><ins>" + registered + "</ins>",
+	));
+	const routes = [{ invocation: "/skill:fabric-workflow", description: "", source: "skill" as const }];
+	expect(await completeSnapshot(backend, emptyDraft, idleSignal, { background, routes })).toEqual([registered]);
+});
+
 describe("buildCompletionContext", () => {
 	test("sends the system instruction and the draft as one JSON user turn", () => {
 		const context = buildCompletionContext({ prefix: "hello wo", suffix: "\n" });
@@ -79,40 +88,25 @@ describe("buildCompletionContext", () => {
 		expect(LONE_SURROGATE.test(draft.suffix)).toBe(false);
 	});
 
-	test("the few-shot examples use the ins wrapper and read as coherent triples", () => {
-		const lines = SYSTEM_PROMPT.split("\n");
-		const inputs = lines.filter(line => line.startsWith("Draft: "));
-		const outputs = lines.filter(line => line.startsWith("Output: "));
-		expect(inputs.length).toBeGreaterThanOrEqual(3);
-		expect(outputs.length).toBe(inputs.length);
-		for (const [index, input] of inputs.entries()) {
-			const { prefix, suffix } = JSON.parse(input.slice("Draft: ".length));
-			const continuation = /^Output: <ins>(.*)<\/ins>$/.exec(outputs[index])?.[1];
-			expect(continuation).toBeDefined();
-			expect(`${prefix}${continuation}${suffix}`).toMatch(/^[A-Za-z].*[.;?)]\s*$/);
-		}
-	});
 });
 
 describe("completeSnapshot", () => {
-	test("按输入框状态选择预算, 包括仅有后缀的输入", () => {
-		expect(completionSettings(emptyDraft)).toEqual({ maxTokens: 1024, deadlineMs: 15000, maxOutputChars: 1200 });
-		expect(completionSettings({ prefix: "", suffix: "x" })).toEqual({ maxTokens: 96, deadlineMs: 4000, maxOutputChars: 400 });
-	});
-
-	test("空框保留详细单行建议, 普通续写仍受短上限约束", async () => {
-		const long = "请完善项目".repeat(250);
-		const { backend, calls } = recording(reply(`<ins>${long}</ins>`));
-		expect(await completeSnapshot(backend, emptyDraft, idleSignal, { background })).toBe(long.slice(0, 1200));
-		expect(await completeSnapshot(backend, { prefix: "x", suffix: "" }, idleSignal)).toBe(long.slice(0, 400));
-		expect(calls[0].context.systemPrompt).not.toEqual(calls[1].context.systemPrompt);
+	test("按输入状态与用途选择预算, 空框默认用途保持 2048 tokens", () => {
+		expect(completionSettings(emptyDraft)).toEqual({ maxTokens: 2048, deadlineMs: 60000, maxOutputChars: 1800 });
+		expect(completionSettings(emptyDraft, "list")).toEqual({ maxTokens: 2048, deadlineMs: 60000, maxOutputChars: 1800 });
+		expect(completionSettings(emptyDraft, "ghost")).toEqual({ maxTokens: 512, deadlineMs: 6000, maxOutputChars: 200 });
+		expect(completionSettings({ prefix: "x", suffix: "" })).toEqual({ maxTokens: 1024, deadlineMs: 60000, maxOutputChars: 1400 });
+		expect(completionSettings({ prefix: "x", suffix: "" }, "list")).toEqual({ maxTokens: 1024, deadlineMs: 60000, maxOutputChars: 1400 });
+		expect(completionSettings({ prefix: "x", suffix: "" }, "ghost")).toEqual({ maxTokens: 288, deadlineMs: 4000, maxOutputChars: 400 });
+		expect(completionSettings({ prefix: "", suffix: "x" }, "ghost")).toEqual({ maxTokens: 288, deadlineMs: 4000, maxOutputChars: 400 });
+		expect(completionSettings({ prefix: "", suffix: "x" }, "list")).toEqual({ maxTokens: 1024, deadlineMs: 60000, maxOutputChars: 1400 });
 	});
 
 	test("空框没有有效对话背景时不请求", async () => {
 		const { backend, calls } = recording(reply("不应调用"));
-		expect(await completeSnapshot(backend, emptyDraft, idleSignal)).toBeNull();
-		expect(await completeSnapshot(backend, emptyDraft, idleSignal, { background: { ...background, recentTurns: [] } })).toBeNull();
-		expect(await completeSnapshot(backend, emptyDraft, idleSignal, { background: { ...background, recentTurns: [{ role: "user", text: "  " }] } })).toBeNull();
+		expect(await completeSnapshot(backend, emptyDraft, idleSignal)).toEqual([]);
+		expect(await completeSnapshot(backend, emptyDraft, idleSignal, { background: { ...background, recentTurns: [] } })).toEqual([]);
+		expect(await completeSnapshot(backend, emptyDraft, idleSignal, { background: { ...background, recentTurns: [{ role: "user", text: "  " }] } })).toEqual([]);
 		expect(calls.length).toBe(0);
 	});
 
@@ -126,12 +120,12 @@ describe("completeSnapshot", () => {
 		const pending = completeSnapshot(waiting, emptyDraft, controller.signal, { background });
 		controller.abort();
 		expect((await errorOf(pending)).name).toBe("AbortError");
-		expect(await completeSnapshot(waiting, emptyDraft, idleSignal, { background, deadlineMs: 5 })).toBeNull();
+		expect(await completeSnapshot(waiting, emptyDraft, idleSignal, { background, deadlineMs: 5 })).toEqual([]);
 	});
 	test("returns the normalised text of the reply", async () => {
 		const { backend, calls } = recording(reply("rld\nignored"));
 		const text = await completeSnapshot(backend, { prefix: "hello wo", suffix: "" }, idleSignal);
-		expect(text).toBe("rld");
+		expect(text).toEqual(["rld\nignored"]);
 		expect(calls.length).toBe(1);
 		expect(draftOf(calls[0].context)).toEqual({ prefix: "hello wo", suffix: "" });
 	});
@@ -140,12 +134,12 @@ describe("completeSnapshot", () => {
 		const { backend } = recording(
 			reply("", { content: [{ type: "thinking", thinking: "hmm" }, { type: "text", text: "r" }, { type: "text", text: "ld" }] } as Partial<AssistantMessage>),
 		);
-		expect(await completeSnapshot(backend, { prefix: "wo", suffix: "" }, idleSignal)).toBe("rld");
+		expect(await completeSnapshot(backend, { prefix: "wo", suffix: "" }, idleSignal)).toEqual(["rld"]);
 	});
 
 	test("an empty or whitespace reply yields null", async () => {
-		expect(await completeSnapshot(recording(reply("")).backend, { prefix: "x", suffix: "" }, idleSignal)).toBeNull();
-		expect(await completeSnapshot(recording(reply("  \n")).backend, { prefix: "x", suffix: "" }, idleSignal)).toBeNull();
+		expect(await completeSnapshot(recording(reply("")).backend, { prefix: "x", suffix: "" }, idleSignal)).toEqual([]);
+		expect(await completeSnapshot(recording(reply("  \n")).backend, { prefix: "x", suffix: "" }, idleSignal)).toEqual([]);
 	});
 
 	test("drops suggestions where the agent answers the draft, keeps the user's own next words", async () => {
@@ -158,9 +152,11 @@ describe("completeSnapshot", () => {
 			["Please fix this issue. ", "I'll fix it now."],
 			["Run the tests.", " Let me check the failures."],
 			['Use "strict".', " I\u2019m going to update the config."],
+			["请修复问题", "好的，我来处理。"],
+			["请修复问题。", "我来检查一下。"],
 		];
 		for (const [prefix, raw] of answers) {
-			expect(await suggest(prefix, raw)).toBeNull();
+			expect(await suggest(prefix, raw)).toEqual([]);
 		}
 		const ownWords: Array<[string, string, string]> = [
 			["Can you make", " sure the tests pass?", " sure the tests pass?"],
@@ -171,7 +167,7 @@ describe("completeSnapshot", () => {
 			["Please fix this issue. ", "Also add a regression test.", "Also add a regression test."],
 		];
 		for (const [prefix, raw, expected] of ownWords) {
-			expect(await suggest(prefix, raw)).toBe(expected);
+			expect(await suggest(prefix, raw)).toEqual([expected]);
 		}
 	});
 
@@ -217,14 +213,14 @@ describe("completeSnapshot", () => {
 			signal.addEventListener("abort", () => reject(new Error("timeout")), { once: true });
 			return promise;
 		};
-		expect(await completeSnapshot(rejecting, { prefix: "x", suffix: "" }, idleSignal, { deadlineMs: 5 })).toBeNull();
+		expect(await completeSnapshot(rejecting, { prefix: "x", suffix: "" }, idleSignal, { deadlineMs: 5 })).toEqual([]);
 
 		const reporting: CompletionBackend = (_context, signal) => {
 			const { promise, resolve } = Promise.withResolvers<AssistantMessage>();
 			signal.addEventListener("abort", () => resolve(reply("", { stopReason: "aborted" })), { once: true });
 			return promise;
 		};
-		expect(await completeSnapshot(reporting, { prefix: "x", suffix: "" }, idleSignal, { deadlineMs: 5 })).toBeNull();
+		expect(await completeSnapshot(reporting, { prefix: "x", suffix: "" }, idleSignal, { deadlineMs: 5 })).toEqual([]);
 	});
 
 	test("provider errors surface as a one-line error without the draft", async () => {
@@ -241,17 +237,24 @@ describe("completeSnapshot", () => {
 		const { backend } = recording(reply("x"));
 		await expect(completeSnapshot(backend, { prefix: "x", suffix: "" }, undefined as unknown as AbortSignal)).rejects.toThrow("AbortSignal is required");
 	});
+
+	test("一次请求独立过滤、去重并最多返回三个候选", async () => {
+		const { backend, calls } = recording(reply("<ins> Sure, on it.</ins>\n<ins> add tests.</ins>\n<ins> add tests.</ins>\n<ins> update docs.</ins>\n<ins> check types.</ins>\n<ins> extra.</ins>"));
+		expect(await completeSnapshot(backend, { prefix: "Please", suffix: "" }, idleSignal)).toEqual([" add tests.", " update docs.", " check types."]);
+		expect(calls.length).toBe(1);
+	});
 });
 
 describe("normalizeCompletionText", () => {
-	test("keeps the first physical line and drops the rest", () => {
-		expect(normalizeCompletionText("rld\nextra line")).toBe("rld");
-		expect(normalizeCompletionText("first\r\nsecond")).toBe("first");
+	test("keeps interior line breaks and trims blank leading and trailing lines", () => {
+		expect(normalizeCompletionText("rld\nextra line")).toBe("rld\nextra line");
+		expect(normalizeCompletionText("first\r\nsecond")).toBe("first\nsecond");
 		expect(normalizeCompletionText("rld\n")).toBe("rld");
+		expect(normalizeCompletionText("\n\n  return value;")).toBe("  return value;");
+		expect(normalizeCompletionText("first\n\nsecond")).toBe("first\n\nsecond");
 	});
 
-	test("never invents a continuation from the next line, and keeps leading spaces", () => {
-		expect(normalizeCompletionText("\n\n  return value;")).toBeNull();
+	test("keeps leading spaces and a leading-space continuation", () => {
 		expect(normalizeCompletionText(" world")).toBe(" world");
 		expect(normalizeCompletionText("  return value;")).toBe("  return value;");
 	});
@@ -303,9 +306,11 @@ describe("normalizeCompletionText", () => {
 
 	test("caps very long output without splitting surrogate pairs", () => {
 		const long = `${"a".repeat(500)}\u{1F600}tail`;
-		const text = normalizeCompletionText(long);
-		expect(text).not.toBeNull();
-		expect((text as string).length).toBeLessThanOrEqual(400);
-		expect(LONE_SURROGATE.test(text as string)).toBe(false);
+		const capped = normalizeCompletionText(long, 400);
+		expect(capped).not.toBeNull();
+		expect((capped as string).length).toBeLessThanOrEqual(400);
+		expect(LONE_SURROGATE.test(capped as string)).toBe(false);
+		// The default cap is the draft-list parse budget.
+		expect(normalizeCompletionText(long)).toBe(long);
 	});
 });
